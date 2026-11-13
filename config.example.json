@@ -1,0 +1,11 @@
+{
+  "host": "127.0.0.1",
+  "port": 8760,
+  "name": "",
+  "fps": 8,
+  "quality": 70,
+  "max_width": 1920,
+  "control": true,
+  "mic": true,
+  "frame_ancestors": ["'self'", "http://127.0.0.1:*", "http://localhost:*"]
+}

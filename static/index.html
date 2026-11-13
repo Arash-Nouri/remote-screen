@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote screen</title>
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="viewer.css">
+<script>if(new URLSearchParams(location.search).get('view') === 'assistant') document.documentElement.classList.add('embed');</script>
+</head>
+<body>
+<header class="bar">
+  <span class="name" id="name">Remote screen</span>
+  <span class="state" id="state">Connecting…</span>
+  <span class="grow"></span>
+  <select id="mon" hidden title="Which screen"></select>
+  <button type="button" id="ctl" hidden title="Mouse and keyboard drive this screen">Control</button>
+  <button type="button" id="mic" hidden title="Hear its microphone">Listen</button>
+  <button type="button" id="full" title="Full screen">⤢</button>
+</header>
+<main class="stage" id="stage">
+  <canvas id="view" tabindex="0"></canvas>
+  <form class="gate" id="gate" hidden>
+    <h2>Access key</h2>
+    <p id="gate-msg">This computer's access key (run <code>python server.py --url</code> on it).</p>
+    <input id="key" type="password" autocomplete="off" spellcheck="false" placeholder="Key">
+    <button type="submit">Connect</button>
+  </form>
+</main>
+<script src="viewer.js"></script>
+</body>
+</html>
