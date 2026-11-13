@@ -25,3 +25,7 @@ body{display:flex;flex-direction:column}
 html.embed .bar{padding:4px 8px;gap:6px}
 html.embed .bar .name{display:none}
 html.embed #full{display:none}
+.perm{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#3a2a12;border-bottom:1px solid #5a4220;color:#f3d9a8;flex:none}
+.perm button{background:transparent;color:inherit;border:1px solid #8a6a35;border-radius:6px;padding:2px 8px;font:inherit;cursor:pointer}
+.perm button:hover{border-color:#f3d9a8}
+.perm .grow{flex:1}

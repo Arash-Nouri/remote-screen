@@ -1,12 +1,12 @@
 // remote-screen viewer: the live screen on a canvas, mouse + keyboard back to it (Control), its microphone (Listen).
 // Access key: from #key=… in the address (then kept in this browser, and taken out of the address), else asked.
 // Embedded in another page it talks to that page with postMessage:
-//   parent -> {type:'desktop-hello'}            : start telling it {type:'desktop-state', connected}
-//   parent -> {type:'desktop-shot', id, edge}   : reply {type:'desktop-shot', id, url (JPEG data URL) | error}
+//   parent -> {type:'desktop-hello'}            : start telling it {type:'desktop-state', connected, screens}
+//   parent -> {type:'desktop-shot', id, edge, mon?} : (mon = 1, 2… for that screen, else the one shown) reply {type:'desktop-shot', id, url (JPEG data URL) | error}
 (function(){
 const $ = id => document.getElementById(id);
 const canvas = $('view'), ctx = canvas.getContext('2d'), stage = $('stage');
-const ui = {name: $('name'), state: $('state'), mon: $('mon'), ctl: $('ctl'), mic: $('mic'), full: $('full'), gate: $('gate'), key: $('key'), gateMsg: $('gate-msg')};
+const ui = {perm: $('perm'), name: $('name'), state: $('state'), mon: $('mon'), ctl: $('ctl'), mic: $('mic'), full: $('full'), gate: $('gate'), key: $('key'), gateMsg: $('gate-msg')};
 
 // ---- key ----
 const KEY = 'rs-key';
@@ -35,8 +35,9 @@ function setState(text, cls){ ui.state.textContent = text; ui.state.className = 
 function setLive(on){ if(on === live) return; live = on; tellParent(); }
 
 // ---- connection ----
+const LOCAL = /^(127\.0\.0\.1|localhost|\[::1\])$/.test(location.hostname);   // on that computer itself: no key needed
 function connect(){
-  if(!key){ askKey(); return; }
+  if(!key && !LOCAL){ askKey(); return; }
   setState('Connecting…');
   const s = ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   s.binaryType = 'arraybuffer';
@@ -69,8 +70,10 @@ function onText(d){
     setState('Connected', 'live');
     send({t: 'view', mon, on: true});
     if(wantAudio) send({t: 'mic', on: true});
+    drawPerms(d.perms);
   }
   if(d.t === 'mic') onMic(d);
+  if(d.t === 'perms') drawPerms(d.perms);
 }
 
 function onBinary(buf){
@@ -96,6 +99,30 @@ new ResizeObserver(fit).observe(stage);
 
 ui.mon.addEventListener('change', () => { mon = +ui.mon.value; send({t: 'view', mon, on: true}); });
 ui.full.addEventListener('click', () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {}));
+
+// ---- permissions (macOS): what's missing on that computer, ask again, restart it ----
+const PERM = {screen: ['Screen Recording', 'only the desktop picture shows, not the windows'],
+              control: ['Accessibility', 'Control can\'t move the mouse or type'],
+              mic: ['Microphone', 'Listen stays silent']};
+function drawPerms(p){
+  const missing = Object.keys(PERM).filter(k => p && p[k] !== undefined && p[k] !== true);
+  ui.perm.hidden = !missing.length;
+  if(!missing.length) return;
+  const who = info ? info.name : 'that computer';
+  ui.perm.innerHTML = '';
+  const t = document.createElement('span');
+  t.textContent = 'On ' + who + ', allow ' + missing.map(k => PERM[k][0] + ' (' + PERM[k][1] + ')').join(', ') + ' for Remote Screen.';
+  ui.perm.append(t);
+  missing.forEach(k => {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Ask for ' + PERM[k][0];
+    b.title = 'Shows macOS\'s prompt on ' + who + ', or opens the place in System Settings if it was turned down before';
+    b.onclick = () => send({t: 'perms', ask: k}); ui.perm.append(b);
+  });
+  const g = document.createElement('span'); g.className = 'grow'; ui.perm.append(g);
+  const r = document.createElement('button'); r.type = 'button'; r.textContent = 'Restart it';
+  r.title = 'macOS uses a new permission after a restart'; r.onclick = () => { send({t: 'restart'}); setState('Restarting…'); };
+  ui.perm.append(r);
+}
 
 // ---- control ----
 function drawCtl(){ ui.ctl.classList.toggle('on', control); canvas.classList.toggle('ctl', control); }
@@ -160,7 +187,7 @@ function stopAudio(keepWanted){ playAt = 0; if(!keepWanted){ wantAudio = false; 
 // ---- embedding page ----
 let parentOrigin = null;
 function tellParent(){
-  if(parentOrigin) try{ parent.postMessage({type: 'desktop-state', connected: live}, parentOrigin); }catch(e){}
+  if(parentOrigin) try{ parent.postMessage({type: 'desktop-state', connected: live, screens: info ? info.monitors.length : 0}, parentOrigin); }catch(e){}
 }
 addEventListener('message', e => {
   if(window.parent === window || e.source !== window.parent || !e.data) return;
@@ -170,7 +197,7 @@ addEventListener('message', e => {
     const reply = o => parent.postMessage(Object.assign({type: 'desktop-shot', id: d.id}, o), e.origin);
     if(!live){ reply({error: 'not connected'}); return; }
     const edge = Math.max(64, Math.min(+d.edge || 1568, 8000));
-    fetch('shot?edge=' + edge + '&mon=' + mon, {headers: {'X-Key': key}, cache: 'no-store'})
+    fetch('shot?edge=' + edge + '&mon=' + (+d.mon || mon), {headers: {'X-Key': key}, cache: 'no-store'})
       .then(r => r.ok ? r.blob() : Promise.reject(new Error('HTTP ' + r.status)))
       .then(b => new Promise(ok => { const f = new FileReader(); f.onload = () => ok(f.result); f.readAsDataURL(b); }))
       .then(url => reply({url}), err => reply({error: String(err.message || err)}));

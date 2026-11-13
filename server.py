@@ -3,17 +3,25 @@
     python server.py             run (install.sh / install.ps1 start it at login)
     python server.py --url       print the viewer address with the access key in it
     python server.py --new-key   make a new access key (old links stop working)
+    python server.py --join DIRECTORY_URL KEY --public-url MY_URL
+                                 join a group: use its key, and check in with its directory
 
 One page (static/) at http://<host>:<port>/ shows the screen live; with Control on, the mouse and
 keyboard drive it; Listen plays the microphone. Everything except the page's own files needs the
-access key (config.json, made on first run). Listens on 127.0.0.1 unless config.json says otherwise.
+access key (config.json, made on first run), except when opened on this computer itself (127.0.0.1, its own page). Listens on 127.0.0.1 unless config.json says otherwise.
 
 Wire format, one WebSocket at /ws:
   client -> {"t":"hello","key"} then {"t":"view","mon"} / {"t":"ack"} (one per frame; the next frame waits
             for it) / {"t":"mic","on"} / input: {"t":"move","x","y"} {"t":"btn","b","down","x","y"}
             {"t":"wheel","dx","dy"} {"t":"key","code","key","down"} (x, y = 0..1 of the shown monitor)
   server -> {"t":"info",...} / {"t":"err","msg"}; binary: 0x01 + JPEG frame, 0x02 + 16-bit mono PCM
-GET /shot?edge=N&mon=M with header X-Key -> one JPEG, longest side <= N.
+GET /shot?edge=N&mon=M with header X-Key -> one JPEG, longest side <= N. GET /screens -> {name, screens: [{w, h}]}.
+Both answer other pages' fetches (CORS).
+
+Devices: computers that share one key form a group. One of them is the directory: the others (config "directory" =
+its address, "url" = their own address as the others reach it) check in every minute (POST /announce), and
+GET /devices on the directory lists the ones seen in the last few minutes, itself included. Both need X-Key;
+/devices also answers other pages' fetches (CORS), so a page that knows the key can show the list.
 """
 import argparse
 import asyncio
@@ -32,12 +40,17 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-CFG_PATH = HERE / "config.json"
+# settings + log: beside the code, except on macOS, where a program started at login may not read ~/Documents
+DATA = Path.home() / "Library" / "Application Support" / "remote-screen" if sys.platform == "darwin" else HERE
+CFG_PATH = DATA / "config.json"
 STATIC = HERE / "static"
 DEFAULTS = {
     "host": "127.0.0.1",
     "port": 8760,
     "key": "",
+    "id": "",                 # made on first run; tells devices apart in the directory
+    "url": "",                # this computer's viewer address as other devices reach it (for the directory)
+    "directory": "",          # the group's directory (a device's address); empty = none, or this one is it
     "name": "",               # shown in the viewer; default = this computer's name
     "fps": 8,
     "quality": 70,            # JPEG quality of the live view
@@ -60,6 +73,7 @@ def _read_saved():
 
 
 def _save(saved):
+    DATA.mkdir(parents=True, exist_ok=True)
     CFG_PATH.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(CFG_PATH, 0o600)
@@ -69,8 +83,10 @@ def _save(saved):
 
 def load_cfg(new_key=False):
     saved = _read_saved()
-    if new_key or not saved.get("key"):
-        saved["key"] = secrets.token_urlsafe(24)
+    if new_key or not saved.get("key") or not saved.get("id"):
+        if new_key or not saved.get("key"):
+            saved["key"] = secrets.token_urlsafe(24)
+        saved["id"] = saved.get("id") or secrets.token_hex(6)
         _save(saved)
     cfg = dict(DEFAULTS)
     cfg.update(saved)
@@ -246,6 +262,73 @@ class Mic:
             pass
 
 
+# ---- macOS permissions -----------------------------------------------------
+
+SETTINGS_PANE = {"screen": "Privacy_ScreenCapture", "control": "Privacy_Accessibility", "mic": "Privacy_Microphone"}
+
+
+def _fw(name):
+    import ctypes
+    return ctypes.cdll.LoadLibrary("/System/Library/Frameworks/%s.framework/%s" % (name, name))
+
+
+def mac_perms(ask=(), cfg=None):
+    """{screen, control, mic}: True = allowed, False = not, None = never asked (mic only). macOS only, else {}.
+    ask = the ones to request now: macOS shows its prompt the first time; after a no, it stays silent."""
+    if sys.platform != "darwin":
+        return {}
+    import ctypes
+    out = {}
+    try:
+        cg = _fw("CoreGraphics")
+        cg.CGPreflightScreenCaptureAccess.restype = cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        out["screen"] = bool(cg.CGPreflightScreenCaptureAccess())
+        if "screen" in ask and not out["screen"]:
+            cg.CGRequestScreenCaptureAccess()
+    except Exception as e:
+        log.warning("screen permission check failed: %s", e)
+    try:
+        ax, cf = _fw("ApplicationServices"), _fw("CoreFoundation")
+        ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        out["control"] = bool(ax.AXIsProcessTrusted())
+        if "control" in ask and not out["control"]:
+            cf.CFDictionaryCreate.restype = ctypes.c_void_p
+            cf.CFDictionaryCreate.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_long] + [ctypes.c_void_p] * 2
+            keys = (ctypes.c_void_p * 1)(ctypes.c_void_p.in_dll(ax, "kAXTrustedCheckOptionPrompt").value)
+            vals = (ctypes.c_void_p * 1)(ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue").value)
+            opts = cf.CFDictionaryCreate(None, keys, vals, 1,
+                                         ctypes.addressof(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks")),
+                                         ctypes.addressof(ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks")))
+            ax.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+            ax.AXIsProcessTrustedWithOptions(opts)
+            cf.CFRelease.argtypes = [ctypes.c_void_p]; cf.CFRelease(opts)
+    except Exception as e:
+        log.warning("accessibility check failed: %s", e)
+    try:
+        objc, av = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib"), _fw("AVFoundation")
+        objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
+        send = objc.objc_msgSend
+        send.restype, send.argtypes = ctypes.c_long, [ctypes.c_void_p] * 3
+        st = send(objc.objc_getClass(b"AVCaptureDevice"), objc.sel_registerName(b"authorizationStatusForMediaType:"),
+                  ctypes.c_void_p.in_dll(av, "AVMediaTypeAudio").value)
+        out["mic"] = None if st == 0 else st == 3
+        if "mic" in ask and st == 0:   # opening the microphone is what makes macOS ask
+            try:
+                m = Mic(16000, lambda b: None); time.sleep(0.5); m.close()
+            except Exception as e:
+                log.warning("microphone open failed: %s", e)
+    except Exception as e:
+        log.warning("microphone check failed: %s", e)
+    if cfg is not None:   # only what this computer allows at all
+        out = {k: v for k, v in out.items() if k == "screen" or cfg.get(k)}
+    return out
+
+
+def mac_open_settings(which):
+    import subprocess
+    subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?" + SETTINGS_PANE[which]])
+
+
 # ---- web -------------------------------------------------------------------
 
 def build_app(cfg):
@@ -253,6 +336,15 @@ def build_app(cfg):
 
     key = cfg["key"].encode()
     ok_key = lambda k: isinstance(k, str) and secrets.compare_digest(k.encode(), key)
+    own = {"http://%s:%s" % (h, cfg["port"]) for h in ("127.0.0.1", "localhost", "[::1]")}
+
+    def local(request):
+        """Opened on this computer itself, by its own page: no key needed. Not through a proxy (that would be
+        another device), and not from some other site's page in this computer's browser."""
+        h = request.headers
+        if request.remote not in ("127.0.0.1", "::1") or any(x in h for x in ("X-Forwarded-For", "Forwarded", "Tailscale-User-Login")):
+            return False
+        return h.get("Origin") in own or ("Origin" not in h and h.get("Sec-Fetch-Site", "same-origin") == "same-origin")
     csp = "frame-ancestors " + " ".join(cfg["frame_ancestors"])
 
     @web.middleware
@@ -273,14 +365,25 @@ def build_app(cfg):
             raise web.HTTPNotFound()
         return web.FileResponse(f)
 
-    async def shot(request):
-        if not ok_key(request.headers.get("X-Key")):
+    async def shot(request):   # also answers other pages' fetches (CORS): a page that knows the key can take shots
+        if request.method == "OPTIONS":
+            return cors(request, web.Response(status=204))
+        if not (local(request) or ok_key(request.headers.get("X-Key"))):
             await asyncio.sleep(1)
-            raise web.HTTPForbidden()
+            return cors(request, web.Response(status=403))
         edge = max(64, min(int(request.query.get("edge", 1568) or 1568), 8000))
         mon = int(request.query.get("mon", 1) or 1)
         jpg, _ = await asyncio.to_thread(grab, mon, edge, None, 88)
-        return web.Response(body=jpg, content_type="image/jpeg")
+        return cors(request, web.Response(body=jpg, content_type="image/jpeg"))
+
+    async def screens(request):   # {name, screens: [{w, h}]}, same rules as /shot
+        if request.method == "OPTIONS":
+            return cors(request, web.Response(status=204))
+        if not (local(request) or ok_key(request.headers.get("X-Key"))):
+            await asyncio.sleep(1)
+            return cors(request, web.Response(status=403))
+        mons = await asyncio.to_thread(monitors)
+        return cors(request, web.json_response({"name": cfg["name"], "screens": [{"w": m["width"], "h": m["height"]} for m in mons]}))
 
     async def ws_handler(request):
         ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 16)
@@ -289,7 +392,7 @@ def build_app(cfg):
             first = await ws.receive_json(timeout=10)
         except Exception:
             await ws.close(); return ws
-        if first.get("t") != "hello" or not ok_key(first.get("key")):
+        if first.get("t") != "hello" or not (local(request) or ok_key(first.get("key"))):
             await asyncio.sleep(1)
             await ws.send_json({"t": "err", "msg": "bad key"})
             await ws.close(); return ws
@@ -299,8 +402,63 @@ def build_app(cfg):
         log.info("viewer left (%s)", peer)
         return ws
 
+    seen = {}   # directory: id -> {id, name, url, os, seen}
+    ONLINE = 150
+
+    def me():
+        return {"id": cfg["id"], "name": cfg["name"], "url": cfg["url"], "os": platform.system()}
+
+    def cors(request, resp):
+        resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+        resp.headers["Access-Control-Allow-Headers"] = "X-Key"
+        resp.headers["Access-Control-Allow-Methods"] = "GET"
+        resp.headers["Vary"] = "Origin"
+        return resp
+
+    async def announce(request):
+        if not ok_key(request.headers.get("X-Key")):
+            await asyncio.sleep(1)
+            raise web.HTTPForbidden()
+        d = await request.json()
+        if not (isinstance(d.get("id"), str) and isinstance(d.get("url"), str) and d["url"].startswith(("http://", "https://"))):
+            raise web.HTTPBadRequest()
+        seen[d["id"][:40]] = {"id": d["id"][:40], "name": str(d.get("name") or "?")[:60], "url": d["url"][:300],
+                              "os": str(d.get("os") or "")[:20], "seen": time.time()}
+        return web.json_response({"ok": True})
+
+    async def devices(request):
+        if request.method == "OPTIONS":
+            return cors(request, web.Response())
+        if not ok_key(request.headers.get("X-Key")):
+            await asyncio.sleep(1)
+            return cors(request, web.Response(status=403))
+        now = time.time()
+        out = [dict(me(), seen=now)] if cfg["url"] else []
+        out += [v for k, v in seen.items() if now - v["seen"] < ONLINE and k != cfg["id"]]
+        out.sort(key=lambda v: v["name"].lower())
+        return cors(request, web.json_response({"devices": out}))
+
+    async def check_in(app):
+        import aiohttp
+        target = cfg["directory"].rstrip("/") + "/announce"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as http:
+            while True:
+                try:
+                    async with http.post(target, json=me(), headers={"X-Key": cfg["key"]}) as r:
+                        if r.status != 200:
+                            log.warning("directory said %s", r.status)
+                except Exception as e:
+                    log.warning("directory unreachable: %s", e)
+                await asyncio.sleep(60)
+
+    async def start_check_in(app):
+        if cfg["directory"] and cfg["url"] and cfg["directory"].rstrip("/") != cfg["url"].rstrip("/"):
+            app["check_in"] = asyncio.ensure_future(check_in(app))
+
     app = web.Application(middlewares=[headers])
-    app.add_routes([web.get("/", page), web.get("/ws", ws_handler), web.get("/shot", shot),
+    app.on_startup.append(start_check_in)
+    app.add_routes([web.post("/announce", announce), web.route("*", "/devices", devices),
+                    web.get("/", page), web.get("/ws", ws_handler), web.route("*", "/shot", shot), web.route("*", "/screens", screens),
                     web.get("/{name:[a-z0-9_-]+\\.(?:js|css|svg)}", static)])
     return app
 
@@ -322,7 +480,8 @@ class Session:
         mons = await asyncio.to_thread(monitors)
         await self.ws.send_json({"t": "info", "name": self.cfg["name"], "os": platform.system(),
                                  "monitors": [{"w": m["width"], "h": m["height"]} for m in mons],
-                                 "control": bool(self.cfg["control"]), "mic": bool(self.cfg["mic"])})
+                                 "control": bool(self.cfg["control"]), "mic": bool(self.cfg["mic"]),
+                                 "perms": await asyncio.to_thread(mac_perms, (), self.cfg)})
         tasks = [asyncio.ensure_future(self.video()), asyncio.ensure_future(self.audio_out())]
         try:
             async for msg in self.ws:
@@ -350,6 +509,18 @@ class Session:
             self.acked.set()
         elif t == "mic":
             await self.set_mic(bool(d.get("on")))
+        elif t == "perms":   # {"t":"perms","ask":name}: ask again (macOS only prompts once, so also open Settings there)
+            which = d.get("ask")
+            if which in SETTINGS_PANE:
+                before = await asyncio.to_thread(mac_perms, (), self.cfg)
+                if before.get(which) is not None:   # asked before: the prompt won't come back
+                    mac_open_settings(which)
+                await asyncio.to_thread(mac_perms, (which,), self.cfg)
+            await self.ws.send_json({"t": "perms", "perms": await asyncio.to_thread(mac_perms, (), self.cfg)})
+        elif t == "restart":   # the login item starts it again; macOS applies new permissions on a fresh start
+            log.info("restart asked by a viewer")
+            await self.ws.close()
+            asyncio.get_running_loop().call_later(0.3, os._exit, 0)
         elif t in ("move", "btn", "wheel", "key"):
             if not self.cfg["control"]:
                 return
@@ -413,17 +584,29 @@ def main():
     ap = argparse.ArgumentParser(description="This computer's screen and microphone in a browser.")
     ap.add_argument("--url", action="store_true", help="print the viewer address with the key, then exit")
     ap.add_argument("--new-key", action="store_true", help="make a new access key, then exit")
+    ap.add_argument("--join", nargs=2, metavar=("DIRECTORY_URL", "KEY"), help="join a group, then exit")
+    ap.add_argument("--public-url", metavar="URL", help="this computer's viewer address as other devices reach it")
     a = ap.parse_args()
+    if a.join or a.public_url:
+        saved = _read_saved()
+        if a.join:
+            saved["directory"], saved["key"] = a.join
+        if a.public_url:
+            saved["url"] = a.public_url
+        _save(saved)
+        print("Saved. Restart it (run the installer again) to use it."); return
     cfg = load_cfg(new_key=a.new_key)
     url = "http://%s:%s/#key=%s" % ("127.0.0.1" if cfg["host"] in ("0.0.0.0", "::") else cfg["host"], cfg["port"], cfg["key"])
     if a.url or a.new_key:
         print(url); return
 
-    h = logging.handlers.RotatingFileHandler(HERE / "remote-screen.log", maxBytes=1 << 20, backupCount=2, encoding="utf-8")
+    h = logging.handlers.RotatingFileHandler(DATA / "remote-screen.log", maxBytes=1 << 20, backupCount=2, encoding="utf-8")
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[h] + ([logging.StreamHandler()] if sys.stderr else []))
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
+    if sys.platform == "darwin":   # first run: macOS asks for each permission once
+        mac_perms(ask=("screen", "control", "mic"), cfg=cfg)
     from aiohttp import web
     log.info("listening on %s:%s", cfg["host"], cfg["port"])
     web.run_app(build_app(cfg), host=cfg["host"], port=int(cfg["port"]), print=None, access_log=None)
