@@ -12,9 +12,9 @@ access key (config.json, made on first run), except when opened on this computer
 
 Wire format, one WebSocket at /ws:
   client -> {"t":"hello","key"} then {"t":"view","mon"} / {"t":"ack"} (one per frame; the next frame waits
-            for it) / {"t":"mic","on"} / input: {"t":"move","x","y"} {"t":"btn","b","down","x","y"}
+            for it) / {"t":"mic","on"} / {"t":"clipset","text"} (paste: put it on this clipboard) / input: {"t":"move","x","y"} {"t":"btn","b","down","x","y"}
             {"t":"wheel","dx","dy"} {"t":"key","code","key","down"} (x, y = 0..1 of the shown monitor)
-  server -> {"t":"info",...} / {"t":"err","msg"}; binary: 0x01 + JPEG frame, 0x02 + 16-bit mono PCM
+  server -> {"t":"info",...} / {"t":"err","msg"} / {"t":"clip","text"} (text just copied here); binary: 0x01 + JPEG frame, 0x02 + 16-bit mono PCM
 GET /shot?edge=N&mon=M with header X-Key -> one JPEG, longest side <= N. GET /screens -> {name, screens: [{w, h}]}.
 Both answer other pages' fetches (CORS).
 
@@ -58,6 +58,7 @@ DEFAULTS = {
     "control": True,          # allow mouse + keyboard
     "mic": True,              # allow Listen
     "mic_rate": 24000,
+    "clipboard": True,        # copy/paste text both ways with the viewer (paste needs control too)
     "frame_ancestors": ["'self'", "http://127.0.0.1:*", "http://localhost:*"],   # pages that may embed the viewer
 }
 log = logging.getLogger("remote-screen")
@@ -145,6 +146,84 @@ def grab(mon, max_edge=None, max_width=None, quality=80, last=None):
 
 
 # ---- mouse + keyboard ------------------------------------------------------
+
+# ---- clipboard: text copied on this computer goes to the viewer ------------------
+
+CLIP_MAX = 1 << 20   # longer text isn't sent
+
+
+def clip_marker():
+    """Something cheap that changes whenever the clipboard does (None = read the text to compare)."""
+    if sys.platform == "win32":
+        import ctypes
+        return ctypes.windll.user32.GetClipboardSequenceNumber()
+    return None
+
+
+def clip_text():
+    """The clipboard's text now, or None."""
+    if sys.platform == "darwin":
+        import subprocess
+        r = subprocess.run(["pbpaste"], capture_output=True, timeout=3, env=dict(os.environ, LANG="en_US.UTF-8"))
+        return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        u.GetClipboardData.restype = wintypes.HANDLE
+        k.GlobalLock.argtypes = [wintypes.HGLOBAL]; k.GlobalLock.restype = ctypes.c_void_p
+        k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        for _ in range(5):   # another program may hold it open for a moment
+            if u.OpenClipboard(None):
+                break
+            time.sleep(0.05)
+        else:
+            return None
+        try:
+            h = u.GetClipboardData(13)   # CF_UNICODETEXT
+            if not h:
+                return None
+            p = k.GlobalLock(h)
+            try:
+                return ctypes.wstring_at(p) if p else None
+            finally:
+                k.GlobalUnlock(h)
+        finally:
+            u.CloseClipboard()
+    return None
+
+
+def clip_set(text):
+    """Put text on this computer's clipboard."""
+    if sys.platform == "darwin":
+        import subprocess
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), timeout=3, env=dict(os.environ, LANG="en_US.UTF-8"))
+    elif sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        u, k = ctypes.windll.user32, ctypes.windll.kernel32
+        k.GlobalAlloc.restype = wintypes.HGLOBAL
+        k.GlobalLock.argtypes = [wintypes.HGLOBAL]; k.GlobalLock.restype = ctypes.c_void_p
+        k.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        u.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]; u.SetClipboardData.restype = wintypes.HANDLE
+        data = (text + "\0").encode("utf-16-le")
+        for _ in range(5):
+            if u.OpenClipboard(None):
+                break
+            time.sleep(0.05)
+        else:
+            raise OSError("clipboard busy")
+        try:
+            u.EmptyClipboard()
+            h = k.GlobalAlloc(0x0002, len(data))   # GMEM_MOVEABLE; the clipboard owns it after SetClipboardData
+            p = k.GlobalLock(h)
+            ctypes.memmove(p, data, len(data))
+            k.GlobalUnlock(h)
+            if not u.SetClipboardData(13, h):   # CF_UNICODETEXT
+                raise OSError("SetClipboardData failed")
+        finally:
+            u.CloseClipboard()
+
 
 class Input:
     """Applies the viewer's mouse and keyboard to this computer; releases whatever is still held on close."""
@@ -474,6 +553,7 @@ class Session:
         self.input, self.mic = None, None
         self.loop = asyncio.get_running_loop()
         self.audio = asyncio.Queue(maxsize=20)
+        self.pasted = None   # text the viewer just put on this clipboard: not sent back
 
     async def run(self):
         from aiohttp import WSMsgType
@@ -481,8 +561,11 @@ class Session:
         await self.ws.send_json({"t": "info", "name": self.cfg["name"], "os": platform.system(),
                                  "monitors": [{"w": m["width"], "h": m["height"]} for m in mons],
                                  "control": bool(self.cfg["control"]), "mic": bool(self.cfg["mic"]),
+                                 "clipboard": bool(self.cfg["clipboard"]),
                                  "perms": await asyncio.to_thread(mac_perms, (), self.cfg)})
         tasks = [asyncio.ensure_future(self.video()), asyncio.ensure_future(self.audio_out())]
+        if self.cfg["clipboard"]:
+            tasks.append(asyncio.ensure_future(self.clipboard()))
         try:
             async for msg in self.ws:
                 if msg.type != WSMsgType.TEXT:
@@ -517,6 +600,10 @@ class Session:
                     mac_open_settings(which)
                 await asyncio.to_thread(mac_perms, (which,), self.cfg)
             await self.ws.send_json({"t": "perms", "perms": await asyncio.to_thread(mac_perms, (), self.cfg)})
+        elif t == "clipset":   # the viewer pastes: its text goes on this clipboard before the V key arrives
+            if self.cfg["clipboard"] and self.cfg["control"] and isinstance(d.get("text"), str) and len(d["text"]) <= CLIP_MAX:
+                self.pasted = d["text"]
+                await asyncio.to_thread(clip_set, d["text"])
         elif t == "restart":   # the login item starts it again; macOS applies new permissions on a fresh start
             log.info("restart asked by a viewer")
             await self.ws.close()
@@ -549,6 +636,29 @@ class Session:
         elif not on and self.mic:
             self.mic.close(); self.mic = None
             await self.ws.send_json({"t": "mic", "on": False})
+
+    async def clipboard(self):
+        """Every half second: new text on this computer's clipboard -> {"t":"clip","text"}. What was there when
+        the viewer connected isn't sent, only what's copied after."""
+        def read():
+            return clip_marker(), clip_text()
+        try:
+            mark, text = await asyncio.to_thread(read)
+        except Exception as e:
+            log.warning("clipboard unavailable: %s", e); return
+        while not self.ws.closed:
+            await asyncio.sleep(0.5)
+            try:
+                m = await asyncio.to_thread(clip_marker)
+                if m is not None and m == mark:
+                    continue
+                t = await asyncio.to_thread(clip_text)
+            except Exception:
+                continue
+            mark = m
+            if t and t != text and t != self.pasted and len(t) <= CLIP_MAX:
+                await self.ws.send_json({"t": "clip", "text": t})
+            text = t
 
     async def audio_out(self):
         while not self.ws.closed:

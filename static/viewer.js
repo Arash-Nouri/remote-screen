@@ -6,7 +6,7 @@
 (function(){
 const $ = id => document.getElementById(id);
 const canvas = $('view'), ctx = canvas.getContext('2d'), stage = $('stage');
-const ui = {perm: $('perm'), name: $('name'), state: $('state'), mon: $('mon'), ctl: $('ctl'), mic: $('mic'), full: $('full'), gate: $('gate'), key: $('key'), gateMsg: $('gate-msg')};
+const ui = {perm: $('perm'), name: $('name'), state: $('state'), mon: $('mon'), ctl: $('ctl'), mic: $('mic'), clip: $('clip'), full: $('full'), gate: $('gate'), key: $('key'), gateMsg: $('gate-msg')};
 
 // ---- key ----
 const KEY = 'rs-key';
@@ -74,7 +74,23 @@ function onText(d){
   }
   if(d.t === 'mic') onMic(d);
   if(d.t === 'perms') drawPerms(d.perms);
+  if(d.t === 'clip') onClip(d.text);
 }
+
+// ---- clipboard: text copied there lands on this device's clipboard ----
+// Browsers allow that only while this page has focus; otherwise (or when blocked) a Copy button does it on click.
+let clipText = '', clipTimer = 0;
+function onClip(text){
+  clipText = text;
+  navigator.clipboard.writeText(text).then(() => { ui.clip.hidden = true; flash('Copied to your clipboard'); },
+                                           () => { ui.clip.hidden = false; flash('Text copied there: press Copy'); });
+}
+function flash(msg){
+  clearTimeout(clipTimer); setState(msg, 'live');
+  clipTimer = setTimeout(() => { if(ws && ws.readyState === 1) setState('Connected', 'live'); }, 2500);
+}
+ui.clip.addEventListener('click', () => navigator.clipboard.writeText(clipText).then(
+  () => { ui.clip.hidden = true; flash('Copied to your clipboard'); }, () => flash('This browser blocked the clipboard')));
 
 function onBinary(buf){
   const kind = new Uint8Array(buf, 0, 1)[0];
@@ -146,12 +162,35 @@ canvas.addEventListener('wheel', e => {
   if(dx || dy){ wheelX -= dx; wheelY -= dy; send({t: 'wheel', dx, dy: -dy}); }
 }, {passive: false});
 const held = new Set();
+// paste (⌘V / Ctrl+V): this device's clipboard text goes to that computer's clipboard first, then the V key
+// (held back until then). The browser's paste event carries the text; without one (e.g. Ctrl+V on a Mac), ask for it.
+let pasting = null;
 canvas.addEventListener('keydown', e => {
-  if(!control) return; e.preventDefault();
+  if(!control) return;
+  if(e.code === 'KeyV' && (e.metaKey || e.ctrlKey) && !e.altKey && info && info.clipboard){
+    if(!e.repeat && !pasting){
+      pasting = {code: e.code, key: e.key, done: false};
+      setTimeout(() => { if(pasting && !pasting.done) navigator.clipboard.readText().then(t => finishPaste(t), () => finishPaste(null)); }, 150);
+    }
+    return;   // no preventDefault: the browser fires its paste event
+  }
+  e.preventDefault();
   held.add(e.code); send({t: 'key', code: e.code, key: e.key, down: true});
 });
+document.addEventListener('paste', e => {
+  if(!pasting || pasting.done) return;
+  e.preventDefault(); finishPaste(e.clipboardData ? e.clipboardData.getData('text/plain') : null);
+});
+function finishPaste(text){
+  const p = pasting; if(!p || p.done) return;
+  p.done = true; pasting = null;
+  if(text) send({t: 'clipset', text});
+  send({t: 'key', code: p.code, key: p.key, down: true});
+  send({t: 'key', code: p.code, key: p.key, down: false});
+}
 canvas.addEventListener('keyup', e => {
   if(!control) return; e.preventDefault();
+  if(e.code === 'KeyV' && !held.has('KeyV')) return;   // its press went out with the paste
   held.delete(e.code); send({t: 'key', code: e.code, key: e.key, down: false});
 });
 canvas.addEventListener('blur', () => { held.forEach(code => send({t: 'key', code, key: '', down: false})); held.clear(); });

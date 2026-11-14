@@ -2,7 +2,7 @@
 
 A computer's screen and microphone in a browser, from another device. One small Python server per computer
 (Windows or macOS) that starts at login and keeps running. Its page shows the screen live. **Control** sends your
-mouse and keyboard to it, and **Listen** plays its microphone.
+mouse and keyboard to it, and **Listen** plays its microphone. Copy and paste work both ways: text copied there lands on your clipboard, and pasting (⌘V / Ctrl+V) types in your own clipboard's text.
 
 ## Install
 
@@ -74,6 +74,7 @@ Defaults are in `config.example.json`:
 | `url`, `directory` | this computer's address as the others reach it, and the group's directory (empty = none, or this one is it); set by `--join` / `--public-url`, see Join a group |
 | `fps`, `quality`, `max_width` | live view: frames a second (unchanged frames aren't sent), JPEG quality, width it's scaled down to |
 | `control`, `mic` | allow mouse + keyboard / Listen |
+| `clipboard` | copy/paste text both ways with the viewer (on by default; only what's copied while a viewer is connected is sent; paste also needs `control`) |
 | `frame_ancestors` | pages allowed to embed the viewer (CSP `frame-ancestors`) |
 
 Restart after a change: run the installer again.
@@ -94,6 +95,10 @@ Also `GET /shot?edge=N&mon=M` with header `X-Key: <key>` returns one JPEG, and `
   it can't type on the Windows sign-in or UAC screens.
 - The mouse pointer itself isn't in the picture on Windows. With Control on, your own pointer is where it is.
 - Keys go by physical key position; on a Mac viewing Windows, ⌘ is the Windows key (use Ctrl for shortcuts).
+
+- Copied text reaches your clipboard only while the viewer has focus (browsers' rule); otherwise a **Copy** button
+  appears in its bar. Paste uses the browser's paste event; where there's none (Ctrl+V on a Mac) the browser asks once
+  to read the clipboard. An embedding page's iframe needs `allow="clipboard-read; clipboard-write"`. Text only, no images or files.
 
 ## Files
 
